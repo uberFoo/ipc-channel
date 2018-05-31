@@ -24,6 +24,7 @@ use std::mem;
 use std::ops::Deref;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::usize;
 
 mod mach_sys;
@@ -349,11 +350,13 @@ enum SendData<'a> {
     OutOfLine(Option<OsIpcSharedMemory>),
 }
 
-const MAX_INLINE_SIZE: usize = 45 * 1024 * 1024;
+lazy_static! {
+    static ref MAX_INLINE_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
+}
 
 impl<'a> From<&'a [u8]> for SendData<'a> {
     fn from(data: &'a [u8]) -> SendData<'a> {
-        if data.len() > MAX_INLINE_SIZE {
+        if data.len() >= MAX_INLINE_SIZE.load(Ordering::Relaxed) {
             // Convert the data payload into a shared memory region to avoid exceeding
             // any message size limits.
             SendData::OutOfLine(Some(OsIpcSharedMemory::from_bytes(data)))
@@ -484,30 +487,28 @@ impl OsIpcSender {
                 (ports.len() + shared_memory_regions.len()) as u32;
 
             let mut port_descriptor_dest = message.offset(1) as *mut mach_msg_port_descriptor_t;
-            for outgoing_port in ports.into_iter() {
+            for outgoing_port in &ports {
                 (*port_descriptor_dest).name = outgoing_port.port();
                 (*port_descriptor_dest).pad1 = 0;
 
-                (*port_descriptor_dest).disposition = match outgoing_port {
+                (*port_descriptor_dest).disposition = match *outgoing_port {
                     OsIpcChannel::Sender(_) => MACH_MSG_TYPE_MOVE_SEND,
                     OsIpcChannel::Receiver(_) => MACH_MSG_TYPE_MOVE_RECEIVE,
                 };
 
                 (*port_descriptor_dest).type_ = MACH_MSG_PORT_DESCRIPTOR;
                 port_descriptor_dest = port_descriptor_dest.offset(1);
-                mem::forget(outgoing_port);
             }
 
             let mut shared_memory_descriptor_dest =
                 port_descriptor_dest as *mut mach_msg_ool_descriptor_t;
-            for shared_memory_region in shared_memory_regions.into_iter() {
+            for shared_memory_region in &shared_memory_regions {
                 (*shared_memory_descriptor_dest).address =
                     shared_memory_region.as_ptr() as *const c_void as *mut c_void;
                 (*shared_memory_descriptor_dest).size = shared_memory_region.len() as u32;
                 (*shared_memory_descriptor_dest).deallocate = 1;
                 (*shared_memory_descriptor_dest).copy = MACH_MSG_VIRTUAL_COPY as u8;
                 (*shared_memory_descriptor_dest).type_ = MACH_MSG_OOL_DESCRIPTOR;
-                mem::forget(shared_memory_region);
                 shared_memory_descriptor_dest = shared_memory_descriptor_dest.offset(1);
             }
 
@@ -537,8 +538,18 @@ impl OsIpcSender {
                                                MACH_MSG_TIMEOUT_NONE,
                                                MACH_PORT_NULL);
             libc::free(message as *mut _);
+            if os_result == MACH_SEND_TOO_LARGE && data.is_inline() {
+                MAX_INLINE_SIZE.store(data.inline_data().len(), Ordering::Relaxed);
+                return self.send(data.inline_data(), ports, shared_memory_regions);
+            }
             if os_result != MACH_MSG_SUCCESS {
                 return Err(MachError::from(os_result))
+            }
+            for outgoing_port in ports {
+                mem::forget(outgoing_port);
+            }
+            for shared_memory_region in shared_memory_regions {
+                mem::forget(shared_memory_region);
             }
             Ok(())
         }
